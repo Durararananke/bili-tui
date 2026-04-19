@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bili-tui"
+version = "0.1.0"
+description = "A minimal terminal Bilibili login and playback helper."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28,<1.0",
+    "qrcode>=8.2,<9.0",
+    "textual>=0.87",
+    "textual-image>=0.12",
+]
+
+[project.scripts]
+bili-tui = "bili_tui.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

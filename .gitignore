@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.DS_Store
+data/session.json
+data/player_cookies.txt
+data/cache/
+*.egg-info/
