@@ -1,6 +1,6 @@
 # Bili TUI
 
-A small Python TUI for Bilibili that can:
+A light Python TUI for Bilibili that can:
 
 - sign in with a QR code
 - browse your favorite folders and recent watch history in a Pip-Boy-inspired list UI
