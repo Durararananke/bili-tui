@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import hashlib
 import http.cookiejar
 import re
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 import qrcode
+
+
+# Bilibili WBI mixin-key permutation. Concatenate img_key + sub_key (64 hex
+# chars), pick characters at these indices, take the first 32 → mixin_key.
+_WBI_MIXIN_TABLE: tuple[int, ...] = (
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+)
+_WBI_FORBIDDEN = "!'()*"  # stripped from values before signing
 
 
 USER_AGENT = (
@@ -30,27 +42,14 @@ class BiliError(RuntimeError):
 class LoginState:
     qrcode_key: str
     url: str
-    expires_at: float
 
 
 @dataclass(slots=True)
 class VideoSelection:
     bvid: str
-    aid: int
-    cid: int
     title: str
     page_title: str
     page_index: int
-
-
-@dataclass(slots=True)
-class PlaybackBundle:
-    video_url: str
-    audio_url: str | None
-    quality: int
-    cookies: dict[str, str]
-    bvid: str
-    cid: int
 
 
 @dataclass(slots=True)
@@ -65,7 +64,6 @@ class FavoriteFolder:
     media_id: int
     title: str
     media_count: int
-    attr: int
 
 
 @dataclass(slots=True)
@@ -76,7 +74,6 @@ class MediaEntry:
     page_title: str
     author: str
     duration: int
-    cover_url: str | None
     context: str
 
     def page_url(self) -> str:
@@ -92,6 +89,8 @@ class BiliClient:
             follow_redirects=True,
             timeout=15.0,
         )
+        self._wbi_keys: tuple[str, str] | None = None
+        self._wbi_fetched_at: float = 0.0
 
     def export_session(self) -> dict[str, Any]:
         return {
@@ -109,7 +108,6 @@ class BiliClient:
         return LoginState(
             qrcode_key=payload["qrcode_key"],
             url=payload["url"],
-            expires_at=time.time() + 180,
         )
 
     def render_qr_ascii(self, url: str) -> str:
@@ -118,10 +116,25 @@ class BiliClient:
         qr.make(fit=True)
         matrix = qr.get_matrix()
 
+        # Pack two module rows into one terminal row using half-block glyphs.
+        # QR convention: True means a dark module. Terminals usually render
+        # dark-on-light, so we invert (dark module -> space) and use the
+        # opposite glyphs for the light background.
         lines: list[str] = []
-        for row in matrix:
-            pieces = ["  " if cell else "██" for cell in row]
-            lines.append("".join(pieces))
+        for i in range(0, len(matrix), 2):
+            top = matrix[i]
+            bottom = matrix[i + 1] if i + 1 < len(matrix) else [False] * len(top)
+            row_chars: list[str] = []
+            for t, b in zip(top, bottom):
+                if not t and not b:
+                    row_chars.append("█")
+                elif not t and b:
+                    row_chars.append("▀")
+                elif t and not b:
+                    row_chars.append("▄")
+                else:
+                    row_chars.append(" ")
+            lines.append("".join(row_chars))
         return "\n".join(lines)
 
     def poll_login(self, qrcode_key: str) -> tuple[str, bool]:
@@ -142,10 +155,6 @@ class BiliClient:
         if code == 86038:
             raise BiliError("The QR code expired. Please run login again.")
         raise BiliError(f"Login failed: {_api_message(code, message)}")
-
-    def get_current_user_label(self) -> str:
-        profile = self.get_current_user_profile()
-        return f"{profile.uname} Lv{profile.level}" if profile.level else profile.uname
 
     def get_current_user_profile(self) -> UserProfile:
         resp = self._client.get("https://api.bilibili.com/x/web-interface/nav")
@@ -178,7 +187,6 @@ class BiliClient:
                     media_id=int(item.get("id") or 0),
                     title=str(item.get("title") or "Untitled"),
                     media_count=int(item.get("media_count") or 0),
-                    attr=int(item.get("attr") or 0),
                 )
             )
         return results
@@ -219,7 +227,6 @@ class BiliClient:
                     page_title="",
                     author=str(upper.get("name") or "Unknown"),
                     duration=int(item.get("duration") or 0),
-                    cover_url=_clean_cover_url(item.get("cover")),
                     context=f"in {folder_title}",
                 )
             )
@@ -263,15 +270,153 @@ class BiliClient:
                     page_title=page_title,
                     author=str(item.get("author_name") or "Unknown"),
                     duration=duration,
-                    cover_url=_clean_cover_url(item.get("cover")),
                     context=f"progress {format_duration(progress)} / {format_duration(duration)}",
                 )
             )
         cursor = payload.get("cursor") or {}
         next_max = int(cursor.get("max") or 0)
         next_view_at = int(cursor.get("view_at") or 0)
-        has_more = len(results) >= ps and next_max > 0
+        has_more = next_max > 0
         return results, next_max, next_view_at, has_more
+
+    def _get_wbi_keys(self) -> tuple[str, str]:
+        # Cache for an hour — keys rotate daily on Bilibili's side.
+        now = time.time()
+        if self._wbi_keys is not None and now - self._wbi_fetched_at < 3600:
+            return self._wbi_keys
+        resp = self._client.get("https://api.bilibili.com/x/web-interface/nav")
+        # /nav returns code=-101 for unlogged users but data.wbi_img is still
+        # populated, so we can't use _unwrap here.
+        payload = resp.json()
+        data = payload.get("data") or {}
+        wbi_img = data.get("wbi_img") or {}
+        img_url = str(wbi_img.get("img_url") or "")
+        sub_url = str(wbi_img.get("sub_url") or "")
+        if not img_url or not sub_url:
+            raise BiliError("Failed to fetch WBI keys from Bilibili.")
+        img_key = img_url.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        sub_key = sub_url.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        self._wbi_keys = (img_key, sub_key)
+        self._wbi_fetched_at = now
+        return self._wbi_keys
+
+    def _sign_wbi(self, params: dict[str, Any]) -> dict[str, Any]:
+        img_key, sub_key = self._get_wbi_keys()
+        orig = img_key + sub_key
+        mixin_key = "".join(orig[i] for i in _WBI_MIXIN_TABLE)[:32]
+
+        signed: dict[str, Any] = dict(params)
+        signed["wts"] = int(time.time())
+        # strip forbidden chars from values, sort by key, build query string
+        clean: list[tuple[str, str]] = []
+        for key in sorted(signed.keys()):
+            value = str(signed[key])
+            value = "".join(ch for ch in value if ch not in _WBI_FORBIDDEN)
+            clean.append((key, value))
+        query = "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in clean)
+        w_rid = hashlib.md5((query + mixin_key).encode("utf-8")).hexdigest()
+        signed["w_rid"] = w_rid
+        return signed
+
+    def list_feed_rcmd(
+        self, fresh_idx: int = 1, ps: int = 20
+    ) -> tuple[list[MediaEntry], bool]:
+        params = self._sign_wbi(
+            {
+                "fresh_type": 4,
+                "ps": ps,
+                "fresh_idx": fresh_idx,
+                "fresh_idx_1h": fresh_idx,
+            }
+        )
+        resp = self._client.get(
+            "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd",
+            params=params,
+        )
+        payload = _unwrap(resp.json())
+        items = payload.get("item") or []
+        if not isinstance(items, list):
+            raise BiliError("Bilibili returned an unexpected rcmd response.")
+
+        results: list[MediaEntry] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            # Skip ads / live cards etc — keep only archive videos.
+            if str(item.get("goto") or "") != "av":
+                continue
+            bvid = str(item.get("bvid") or "").strip()
+            if not bvid:
+                continue
+            owner = item.get("owner") or {}
+            stat = item.get("stat") or {}
+            views = int(stat.get("view") or 0)
+            results.append(
+                MediaEntry(
+                    title=str(item.get("title") or "Untitled"),
+                    bvid=bvid,
+                    page_index=1,
+                    page_title="",
+                    author=str(owner.get("name") or "Unknown"),
+                    duration=int(item.get("duration") or 0),
+                    context=f"recommended / {_format_count(views)} views",
+                )
+            )
+        has_more = len(results) > 0
+        return results, has_more
+
+    def search_videos(
+        self, keyword: str, page: int = 1, ps: int = 20
+    ) -> tuple[list[MediaEntry], bool, int]:
+        keyword = keyword.strip()
+        if not keyword:
+            return [], False, 0
+        params = self._sign_wbi(
+            {
+                "search_type": "video",
+                "keyword": keyword,
+                "page": page,
+                "page_size": ps,
+                "platform": "pc",
+            }
+        )
+        resp = self._client.get(
+            "https://api.bilibili.com/x/web-interface/wbi/search/type",
+            params=params,
+        )
+        payload = _unwrap(resp.json())
+        results_raw = payload.get("result") or []
+        if not isinstance(results_raw, list):
+            raise BiliError("Bilibili returned an unexpected search response.")
+        total = int(payload.get("numResults") or 0)
+
+        results: list[MediaEntry] = []
+        for item in results_raw:
+            if not isinstance(item, dict):
+                continue
+            bvid = str(item.get("bvid") or "").strip()
+            if not bvid:
+                continue
+            title = _strip_html_tags(str(item.get("title") or "Untitled"))
+            duration_raw = item.get("duration")
+            if isinstance(duration_raw, int):
+                duration = duration_raw
+            else:
+                duration = _parse_duration_str(str(duration_raw or ""))
+            views = int(item.get("play") or 0)
+            results.append(
+                MediaEntry(
+                    title=title,
+                    bvid=bvid,
+                    page_index=1,
+                    page_title="",
+                    author=str(item.get("author") or "Unknown"),
+                    duration=duration,
+                    context=f"search / {_format_count(views)} views",
+                )
+            )
+        has_more = page * ps < total if total else len(results) >= ps
+        return results, has_more, total
 
     def resolve_video(self, raw_url: str) -> VideoSelection:
         bvid = extract_bvid(raw_url)
@@ -289,52 +434,10 @@ class BiliClient:
 
         return VideoSelection(
             bvid=payload["bvid"],
-            aid=payload["aid"],
-            cid=page["cid"],
             title=payload["title"],
             page_title=page["part"],
             page_index=page_index,
         )
-
-    def get_playback_bundle(self, video: VideoSelection) -> PlaybackBundle:
-        params = {
-            "bvid": video.bvid,
-            "cid": video.cid,
-            "qn": 80,
-            "fnval": 16,
-            "fnver": 0,
-            "fourk": 0,
-        }
-        resp = self._client.get(
-            "https://api.bilibili.com/x/player/playurl",
-            params=params,
-        )
-        payload = _unwrap(resp.json())
-        dash = payload.get("dash")
-        if isinstance(dash, dict):
-            video_track = _pick_video_track(dash.get("video") or [])
-            audio_track = _pick_audio_track(dash.get("audio") or [])
-            return PlaybackBundle(
-                video_url=_track_url(video_track),
-                audio_url=_track_url(audio_track) if audio_track else None,
-                quality=int(video_track.get("id", 0)),
-                cookies=_cookie_snapshot(self._client.cookies.jar),
-                bvid=video.bvid,
-                cid=video.cid,
-            )
-
-        durl = payload.get("durl") or []
-        if durl:
-            return PlaybackBundle(
-                video_url=durl[0]["url"],
-                audio_url=None,
-                quality=int(payload.get("quality") or 0),
-                cookies=_cookie_snapshot(self._client.cookies.jar),
-                bvid=video.bvid,
-                cid=video.cid,
-            )
-
-        raise BiliError("No playable stream was returned by Bilibili.")
 
 
 def extract_bvid(raw_url: str) -> str:
@@ -374,6 +477,37 @@ def _api_message(code: int, message: Any) -> str:
     return f"Bilibili API error {code}."
 
 
+def _strip_html_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
+
+
+def _parse_duration_str(raw: str) -> int:
+    raw = raw.strip()
+    if not raw:
+        return 0
+    try:
+        parts = [int(p) for p in raw.split(":")]
+    except ValueError:
+        return 0
+    if len(parts) == 3:
+        h, m, s = parts
+        return h * 3600 + m * 60 + s
+    if len(parts) == 2:
+        m, s = parts
+        return m * 60 + s
+    if len(parts) == 1:
+        return parts[0]
+    return 0
+
+
+def _format_count(value: int) -> str:
+    if value >= 100_000_000:
+        return f"{value / 100_000_000:.1f}亿"
+    if value >= 10_000:
+        return f"{value / 10_000:.1f}万"
+    return str(value)
+
+
 def format_duration(total_seconds: int) -> str:
     seconds = max(int(total_seconds), 0)
     minutes, sec = divmod(seconds, 60)
@@ -381,35 +515,6 @@ def format_duration(total_seconds: int) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{sec:02d}"
     return f"{minutes}:{sec:02d}"
-
-
-def _pick_video_track(tracks: list[dict[str, Any]]) -> dict[str, Any]:
-    if not tracks:
-        raise BiliError("No DASH video tracks were returned.")
-
-    eligible = [track for track in tracks if int(track.get("id", 0)) <= 80]
-    if not eligible:
-        raise BiliError("No non-premium 1080P-or-below video track was returned.")
-
-    target_quality = max(int(track.get("id", 0)) for track in eligible)
-    same_quality = [track for track in eligible if int(track.get("id", 0)) == target_quality]
-
-    avc_tracks = [track for track in same_quality if int(track.get("codecid", 0)) == 7]
-    candidates = avc_tracks or same_quality
-    return max(candidates, key=lambda track: int(track.get("bandwidth", 0)))
-
-
-def _pick_audio_track(tracks: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not tracks:
-        return None
-    return max(tracks, key=lambda track: int(track.get("bandwidth", 0)))
-
-
-def _track_url(track: dict[str, Any]) -> str:
-    url = track.get("baseUrl") or track.get("base_url")
-    if not isinstance(url, str) or not url:
-        raise BiliError("Bilibili returned a stream track without a valid URL.")
-    return url
 
 
 def _cookie_snapshot(jar: http.cookiejar.CookieJar) -> dict[str, str]:
@@ -421,16 +526,6 @@ def _cookie_snapshot(jar: http.cookiejar.CookieJar) -> dict[str, str]:
             selected[cookie.name] = cookie
 
     return {name: cookie.value for name, cookie in selected.items()}
-
-
-def _clean_cover_url(raw: Any) -> str | None:
-    if not isinstance(raw, str) or not raw:
-        return None
-    if raw.startswith("//"):
-        return f"https:{raw}"
-    if raw.startswith("http://"):
-        return "https://" + raw.removeprefix("http://")
-    return raw
 
 
 def _cookie_score(cookie: http.cookiejar.Cookie) -> tuple[int, int, int, int]:

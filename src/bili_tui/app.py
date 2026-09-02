@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
+import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
+from typing import ClassVar
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -20,7 +24,93 @@ from .bilibili import (
     format_duration,
 )
 from .player import PlayerError, open_video_url
-from .storage import export_cookies_for_ytdlp, load_session, save_session
+from .storage import (
+    clear_session,
+    export_cookies_for_ytdlp,
+    load_session,
+    save_session,
+)
+
+
+# ---------------------------------------------------------------------------
+# CRT theme palettes
+# ---------------------------------------------------------------------------
+# The UI is authored against the GREEN palette (original colour scheme). Other
+# palettes just provide the same logical slots with different phosphor tints;
+# we switch themes at startup by rewriting CSS / rich-markup strings, swapping
+# every green hex for the corresponding entry in the chosen palette.
+
+PALETTE_GREEN: dict[str, str] = {
+    "deep": "#020902",
+    "panel": "#071107",
+    "list": "#061006",
+    "alt": "#041106",
+    "bright": "#9bff9b",
+    "light": "#7cff7c",
+    "accent": "#59ff59",
+    "meta": "#4de64d",
+    "dim": "#2fbf2f",
+    "darker": "#1c5a25",
+    "user": "#cdd6f4",
+}
+
+PALETTE_AMBER: dict[str, str] = {
+    "deep": "#0a0600",
+    "panel": "#140d00",
+    "list": "#120b00",
+    "alt": "#0e0700",
+    "bright": "#ffc37a",
+    "light": "#f0a655",
+    "accent": "#e08a30",
+    "meta": "#c47a2a",
+    "dim": "#9a5e1f",
+    "darker": "#5a3b12",
+    "user": "#ffe8c7",
+}
+
+PALETTE_WHITE: dict[str, str] = {
+    "deep": "#050505",
+    "panel": "#0e0e0e",
+    "list": "#0c0c0c",
+    "alt": "#080808",
+    "bright": "#eaeaea",
+    "light": "#c8c8c8",
+    "accent": "#a8a8a8",
+    "meta": "#9a9a9a",
+    "dim": "#707070",
+    "darker": "#3a3a3a",
+    "user": "#a9c8ff",
+}
+
+PALETTE_BLUE: dict[str, str] = {
+    "deep": "#020410",
+    "panel": "#050a1a",
+    "list": "#040820",
+    "alt": "#02061a",
+    "bright": "#9bbfff",
+    "light": "#7ca6ff",
+    "accent": "#5988ff",
+    "meta": "#4d75e6",
+    "dim": "#2f57bf",
+    "darker": "#1c2c5a",
+    "user": "#ffd280",
+}
+
+THEMES: dict[str, dict[str, str]] = {
+    "green": PALETTE_GREEN,
+    "amber": PALETTE_AMBER,
+    "white": PALETTE_WHITE,
+    "blue": PALETTE_BLUE,
+}
+
+
+def _apply_palette(text: str, palette: dict[str, str]) -> str:
+    """Rewrite a string authored in the GREEN palette to use another palette."""
+    if palette is PALETTE_GREEN:
+        return text
+    for key, src_hex in PALETTE_GREEN.items():
+        text = text.replace(src_hex, palette[key])
+    return text
 
 
 def _display_title(entry: MediaEntry) -> str:
@@ -38,24 +128,6 @@ class BrowseSource:
     media_id: int | None = None
 
 
-@dataclass(slots=True)
-class VideoCardData:
-    entry: MediaEntry
-    cover: object | None = None
-
-
-class SourceItem(ListItem):
-    def __init__(self, source: BrowseSource) -> None:
-        self.source = source
-        super().__init__(
-            Vertical(
-                Static(source.label.upper(), classes="source-label"),
-                Static(source.subtitle, classes="source-subtitle"),
-            ),
-            classes="source-item",
-        )
-
-
 class PipTab(Static):
     DEFAULT_CSS = """
     PipTab {
@@ -68,15 +140,27 @@ class PipTab(Static):
         text-style: bold;
     }
 
+    PipTab.-selected {
+        color: #9bff9b;
+        background: transparent;
+    }
+
     PipTab.-active {
         color: #020902;
         background: #59ff59;
     }
     """
 
-    def __init__(self, label: str, active: bool = False, classes: str | None = None) -> None:
+    def __init__(
+        self,
+        label: str,
+        active: bool = False,
+        selected: bool = False,
+        classes: str | None = None,
+    ) -> None:
         super().__init__(label, classes=classes)
         self.set_class(active, "-active")
+        self.set_class(selected and not active, "-selected")
 
 
 class VideoRow(ListItem):
@@ -107,19 +191,19 @@ class VideoRow(ListItem):
     }
     """
 
-    def __init__(self, data: VideoCardData) -> None:
+    def __init__(self, entry: MediaEntry) -> None:
         super().__init__(classes="video-row")
-        self.data = data
+        self.entry = entry
 
     def compose(self) -> ComposeResult:
-        yield Static(_display_title(self.data.entry), classes="video-title")
-        duration = format_duration(self.data.entry.duration)
+        yield Static(_display_title(self.entry), classes="video-title")
+        duration = format_duration(self.entry.duration)
         yield Static(
-            f"UPLINK  {self.data.entry.author}   RUN {duration}",
+            f"UPLINK  {self.entry.author}   RUN {duration}",
             classes="video-meta",
         )
         yield Static(
-            self.data.entry.context.upper(),
+            self.entry.context.upper(),
             classes="video-context",
             markup=True,
         )
@@ -162,13 +246,93 @@ class UrlInputScreen(ModalScreen[str | None]):
     }
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, palette: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self._palette = palette or PALETTE_GREEN
 
     def compose(self) -> ComposeResult:
         with Vertical(id="url-dialog"):
             yield Static("DIRECT VIDEO LINK", id="url-title")
             yield Input(placeholder="https://www.bilibili.com/video/BV...", id="url-input")
-            yield Static("[#9bff9b]ENTER[/] PLAY   [#9bff9b]ESC[/] CANCEL", id="url-help", markup=True)
+            yield Static(
+                _apply_palette("[#9bff9b]ENTER[/] PLAY   [#9bff9b]ESC[/] CANCEL", self._palette),
+                id="url-help",
+                markup=True,
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#url-input", Input).focus()
+
+    @on(Input.Submitted, "#url-input")
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SearchInputScreen(ModalScreen[str | None]):
+    CSS = """
+    SearchInputScreen {
+        align: center middle;
+        background: #041106 80%;
+    }
+
+    #url-dialog {
+        width: 84;
+        height: auto;
+        border: heavy #59ff59;
+        background: #08160a;
+        padding: 1 2;
+    }
+
+    #url-title {
+        text-style: bold;
+        color: #9bff9b;
+        margin: 0 0 1 0;
+    }
+
+    #url-input {
+        border: tall #1c5a25;
+        background: #041106;
+        color: #9bff9b;
+    }
+
+    #url-input:focus {
+        border: tall #59ff59;
+    }
+
+    #url-help {
+        color: #4de64d;
+        margin: 1 0 0 0;
+    }
+    """
+
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, initial: str = "", palette: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self._initial = initial
+        self._palette = palette or PALETTE_GREEN
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="url-dialog"):
+            yield Static("SEARCH VIDEOS", id="url-title")
+            yield Input(
+                value=self._initial,
+                placeholder="Enter keyword...",
+                id="url-input",
+            )
+            yield Static(
+                _apply_palette(
+                    "[#9bff9b]ENTER[/] SEARCH   [#9bff9b]ESC[/] CANCEL",
+                    self._palette,
+                ),
+                id="url-help",
+                markup=True,
+            )
 
     def on_mount(self) -> None:
         self.query_one("#url-input", Input).focus()
@@ -379,36 +543,44 @@ class BiliTuiApp(App[None]):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("q", "quit", "Quit"),
-        Binding("tab", "switch_pane", "Switch Pane", priority=True),
+        Binding("tab", "switch_pane", "Switch Pane"),
         Binding("up,k", "move_up", "Up"),
         Binding("down,j", "move_down", "Down"),
         Binding("left,h", "move_left", "Left"),
         Binding("right,l", "move_right", "Right"),
-        Binding("enter", "activate", "Open", priority=True),
+        Binding("enter", "activate", "Open"),
         Binding("p", "play_selected", "Play"),
         Binding("u", "open_url", "Open URL"),
+        Binding("slash", "search", "Search"),
         Binding("r", "refresh", "Refresh"),
+        Binding("L", "logout", "Logout"),
     ]
 
     def __init__(
         self,
         client: BiliClient | None = None,
         player_opener: Callable[[str, object], None] | None = None,
+        palette: dict[str, str] | None = None,
     ) -> None:
         super().__init__()
         self.client = client or BiliClient(session=load_session())
         self.player_opener = player_opener or open_video_url
+        self._palette = palette or PALETTE_GREEN
         self.sources: list[BrowseSource] = []
         self.favorite_sources: list[BrowseSource] = []
-        self.cards: list[VideoCardData] = []
+        self.cards: list[MediaEntry] = []
         self.selected_card_index = 0
         self.active_pane = "nav"
-        self.primary_tab = "history"
+        # 0 = primary tabs row, 1 = favorite folders row (only used when
+        # primary_tab == "favorites")
+        self.nav_row = 0
+        self.primary_tab = "home"
         self.favorite_tab_index = 0
         self.login_state: LoginState | None = None
         self.login_timer = None
+        self.clock_timer = None
         self.browser_ready = False
         self.page_size = 20
         self.current_page = 1
@@ -417,7 +589,10 @@ class BiliTuiApp(App[None]):
         self.loading_more = False
         # cursor for next history page request (max_oid, view_at)
         self.history_next_cursor: tuple[int, int] = (0, 0)
-        self._active_source_key: tuple[str, int | None] | None = None
+        # fresh_idx cursor for homepage rcmd feed — monotonically increasing
+        self.home_fresh_idx = 1
+        # search state
+        self.search_keyword: str = ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="root"):
@@ -460,6 +635,8 @@ class BiliTuiApp(App[None]):
         self._enter_browser(profile.uname, profile.level)
 
     def action_switch_pane(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
         if not self.browser_ready:
             return
         self.active_pane = "videos" if self.active_pane == "nav" else "nav"
@@ -467,48 +644,107 @@ class BiliTuiApp(App[None]):
         self._set_help()
 
     def action_move_up(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
         if not self.browser_ready:
             return
         if self.active_pane == "videos":
-            self._move_card_cursor(-1)
-        elif self.primary_tab == "favorites":
-            self._move_favorite_tab(-1)
+            # k in the video list: step up; if already at the top, cross
+            # the boundary back into the nav pane, landing on the row
+            # closest to the list (secondary row if favorites has folders).
+            if self.selected_card_index > 0:
+                self._move_card_cursor(-1)
+                return
+            self.active_pane = "nav"
+            self.nav_row = (
+                1 if (self.primary_tab == "favorites" and self.favorite_sources) else 0
+            )
+            self._refresh_pane_styles()
+            self._refresh_nav()
+            self._set_help()
+            return
+        # nav pane — step between rows only.
+        if self.nav_row == 1:
+            self.nav_row = 0
+            self._refresh_nav()
+        # already on row 0: top of app, do nothing
 
     def action_move_down(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
         if not self.browser_ready:
             return
         if self.active_pane == "videos":
             self._move_card_cursor(1)
-        elif self.primary_tab == "favorites":
-            self._move_favorite_tab(1)
+            return
+        # nav pane — row 0 -> row 1 (if favorites with folders) -> videos.
+        if (
+            self.nav_row == 0
+            and self.primary_tab == "favorites"
+            and self.favorite_sources
+        ):
+            self.nav_row = 1
+            self._refresh_nav()
+            return
+        if self.cards:
+            self.active_pane = "videos"
+            self._refresh_pane_styles()
+            self._refresh_nav()
+            self._set_help()
 
     def action_move_left(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
         if not self.browser_ready:
             return
         if self.active_pane == "videos":
             self.active_pane = "nav"
             self._refresh_pane_styles()
+            self._refresh_nav()
             self._set_help()
             return
-        self._move_primary_tab(-1)
+        # nav: move horizontally within the current row.
+        if self.nav_row == 1:
+            self._move_favorite_tab(-1)
+        else:
+            self._move_primary_tab(-1)
 
     def action_move_right(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
         if not self.browser_ready:
             return
         if self.active_pane == "nav":
-            self._move_primary_tab(1)
+            if self.nav_row == 1:
+                self._move_favorite_tab(1)
+            else:
+                self._move_primary_tab(1)
             return
         if self.cards:
             self.active_pane = "videos"
             self._refresh_pane_styles()
+            self._refresh_nav()
             self._set_help()
 
+    @on(ListView.Selected, "#video-list")
+    async def _on_list_selected(self, event: ListView.Selected) -> None:
+        # ListView swallows Enter and emits Selected; route it through the
+        # same activate logic as all other Enter presses.
+        await self.action_activate()
+
     async def action_activate(self) -> None:
+        # If a modal (URL / Search input) is on top of the stack, let it
+        # handle Enter itself — don't steal the key via the priority binding.
+        if len(self.screen_stack) > 1:
+            return
         if self.login_state is not None and not self.browser_ready:
             return
         if not self.browser_ready:
             return
         if self.active_pane == "nav":
+            if self.primary_tab == "search" and not self.search_keyword:
+                self._prompt_search()
+                return
             if self.cards:
                 self.active_pane = "videos"
                 self._refresh_pane_styles()
@@ -520,19 +756,85 @@ class BiliTuiApp(App[None]):
         if not self.cards:
             self._set_status("Nothing is selected.")
             return
-        entry = self.cards[self.selected_card_index].entry
+        entry = self.cards[self.selected_card_index]
         await self._play_entry(entry)
 
     def action_open_url(self) -> None:
         if not self.browser_ready:
             return
-        self.push_screen(UrlInputScreen(), self._handle_url_input)
+        self.push_screen(UrlInputScreen(palette=self._palette), self._handle_url_input)
+
+    def action_search(self) -> None:
+        if not self.browser_ready:
+            return
+        self._prompt_search()
+
+    def _prompt_search(self) -> None:
+        self.push_screen(
+            SearchInputScreen(initial=self.search_keyword, palette=self._palette),
+            self._handle_search_input,
+        )
+
+    def _handle_search_input(self, keyword: str | None) -> None:
+        if keyword is None:
+            return
+        keyword = keyword.strip()
+        if not keyword:
+            return
+        self.search_keyword = keyword
+        self.primary_tab = "search"
+        self.selected_card_index = 0
+        self.active_pane = "nav"
+        self.run_worker(self._render_navigation(), exclusive=True, group="sources")
+        self.run_worker(self._load_current_source(), exclusive=True, group="source-load")
 
     async def action_refresh(self) -> None:
         if not self.browser_ready:
             self._start_login_flow()
             return
         await self._load_current_source()
+
+    def action_logout(self) -> None:
+        if not self.browser_ready:
+            return
+        # cancel any in-flight data loaders
+        for group in ("source-load", "sources", "more", "player"):
+            try:
+                self.workers.cancel_group(self, group)
+            except Exception:
+                pass
+        # stop clock timer so it stops writing to the hidden topbar
+        if self.clock_timer is not None:
+            self.clock_timer.stop()
+            self.clock_timer = None
+        # purge stored credentials and rebuild a blank client
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        clear_session()
+        self.client = BiliClient(session={})
+        # reset browser state
+        self.browser_ready = False
+        self.sources = []
+        self.favorite_sources = []
+        self.cards = []
+        self.selected_card_index = 0
+        self.primary_tab = "home"
+        self.favorite_tab_index = 0
+        self.nav_row = 0
+        self.search_keyword = ""
+        self.home_fresh_idx = 1
+        self.active_pane = "nav"
+        # clear the login card (old QR may still be visible) and show login view
+        for widget_id in ("login-qr", "login-url", "login-status"):
+            try:
+                self.query_one(f"#{widget_id}", Static).update("")
+            except Exception:
+                pass
+        self._show_login_view()
+        self._set_help()
+        self._start_login_flow()
 
     def _show_login_view(self) -> None:
         self.query_one("#login-view").remove_class("hidden")
@@ -588,13 +890,24 @@ class BiliTuiApp(App[None]):
         self.browser_ready = True
         self.login_state = None
         self.active_pane = "nav"
-        account = f"[#cdd6f4]{username}[/]"
-        self.query_one("#topbar-right", Static).update(account)
+        self._account_label = f"[#cdd6f4]{username}[/]"
+        self._tick_clock()
+        if self.clock_timer is None:
+            self.clock_timer = self.set_interval(1.0, self._tick_clock)
         self.query_one("#topbar-center", Static).update(
-            "[#9bff9b]MEDIA ARCHIVE[/] [#2fbf2f]::[/] [#59ff59]FAVORITES / HISTORY[/]"
+            self._c("[#9bff9b]MEDIA ARCHIVE[/] [#2fbf2f]::[/] [#59ff59]HOME / HISTORY / FAVORITES / SEARCH[/]")
         )
         self._show_browser_view()
         self._load_sources()
+
+    def _tick_clock(self) -> None:
+        clock = time.strftime("%H:%M:%S")
+        try:
+            self.query_one("#topbar-right", Static).update(
+                self._c(f"{self._account_label}   [#9bff9b]{clock}[/]")
+            )
+        except Exception:
+            pass
 
     def _load_sources(self) -> None:
         try:
@@ -603,11 +916,15 @@ class BiliTuiApp(App[None]):
             self._set_status(f"Failed to load collections: {exc}")
             folders = []
 
-        self.sources = [self._history_source()]
+        self.sources = [
+            self._home_source(),
+            self._history_source(),
+            self._search_source(),
+        ]
         self.favorite_sources = self._favorite_sources(folders)
         self.sources.extend(self.favorite_sources)
         if self.primary_tab == "favorites" and not self.favorite_sources:
-            self.primary_tab = "history"
+            self.primary_tab = "home"
         if self.favorite_tab_index >= len(self.favorite_sources):
             self.favorite_tab_index = 0
         self.run_worker(self._render_navigation(), exclusive=True, group="sources")
@@ -620,8 +937,10 @@ class BiliTuiApp(App[None]):
         await secondary.remove_children()
         await primary.mount_all(
             [
+                PipTab("HOME", active=self.primary_tab == "home"),
                 PipTab("HISTORY", active=self.primary_tab == "history"),
                 PipTab("FAVORITES", active=self.primary_tab == "favorites"),
+                PipTab("SEARCH", active=self.primary_tab == "search"),
             ]
         )
 
@@ -633,8 +952,21 @@ class BiliTuiApp(App[None]):
                 )
                 for index, source in enumerate(self.favorite_sources)
             )
+        elif self.primary_tab == "home":
+            await secondary.mount_all([PipTab("POPULAR FEED", active=True)])
+        elif self.primary_tab == "search":
+            label = self.search_keyword.upper() if self.search_keyword else "NO KEYWORD"
+            await secondary.mount_all([PipTab(f"QUERY :: {label}", active=True)])
         else:
             await secondary.mount_all([PipTab("RECENT LOG", active=True)])
+
+    def _home_source(self) -> BrowseSource:
+        return BrowseSource(
+            kind="popular",
+            label="Home",
+            title="Bilibili Home",
+            subtitle="Popular videos on Bilibili",
+        )
 
     def _history_source(self) -> BrowseSource:
         return BrowseSource(
@@ -642,6 +974,14 @@ class BiliTuiApp(App[None]):
             label="Recent History",
             title="Recent History",
             subtitle="Latest watched videos",
+        )
+
+    def _search_source(self) -> BrowseSource:
+        return BrowseSource(
+            kind="search",
+            label="Search",
+            title="Search",
+            subtitle="Press / or Enter to search",
         )
 
     def _favorite_sources(self, folders: list[FavoriteFolder]) -> list[BrowseSource]:
@@ -667,10 +1007,18 @@ class BiliTuiApp(App[None]):
         except Exception:
             pass
 
-        source_key = (source.kind, source.media_id)
-        self._active_source_key = source_key
         self.current_page = 1
         self.history_next_cursor = (0, 0)
+        if source.kind == "popular":
+            # Each fresh load of the homepage feed bumps fresh_idx so the
+            # user sees different recommendations every time they hit `r`.
+            self.home_fresh_idx += 1
+        if source.kind == "search":
+            source.subtitle = (
+                f'Results for "{self.search_keyword}"'
+                if self.search_keyword
+                else "Press / or Enter to search"
+            )
         self.loading_more = False
 
         self._set_status(f"[#59ff59]>[/] LOADING {source.title.upper()} ...")
@@ -687,7 +1035,7 @@ class BiliTuiApp(App[None]):
             self._update_page_indicator()
             return
 
-        self.cards = [VideoCardData(entry=e, cover=None) for e in entries]
+        self.cards = entries
         self.has_more = has_more
         self.total_items = total
         self.selected_card_index = 0
@@ -707,6 +1055,22 @@ class BiliTuiApp(App[None]):
         For favorites the page number is passed directly.
         """
         def call() -> tuple[list[MediaEntry], str, bool, int]:
+            if source.kind == "popular":
+                # For load-more (page > 1) advance the rcmd cursor so we get
+                # a fresh batch instead of duplicates.
+                if page > 1:
+                    self.home_fresh_idx += 1
+                entries, has_more = self.client.list_feed_rcmd(
+                    fresh_idx=self.home_fresh_idx, ps=self.page_size
+                )
+                return entries, "Bilibili Home", has_more, 0
+            if source.kind == "search":
+                if not self.search_keyword:
+                    return [], "Search", False, 0
+                entries, has_more, total = self.client.search_videos(
+                    keyword=self.search_keyword, page=page, ps=self.page_size
+                )
+                return entries, f"Search: {self.search_keyword}", has_more, total
             if source.kind == "history":
                 max_oid, view_at = self.history_next_cursor if page > 1 else (0, 0)
                 entries, next_max, next_view_at, has_more = self.client.list_history_items(
@@ -724,9 +1088,11 @@ class BiliTuiApp(App[None]):
 
     def _format_subtitle(self) -> str:
         if self.total_items:
-            return f"[#59ff59]{len(self.cards)}[/] OF [#59ff59]{self.total_items}[/] RECORDS"
-        suffix = " [#2fbf2f](MORE AVAILABLE)[/]" if self.has_more else ""
-        return f"[#59ff59]{len(self.cards)}[/] RECORDS{suffix}"
+            text = f"[#59ff59]{len(self.cards)}[/] OF [#59ff59]{self.total_items}[/] RECORDS"
+        else:
+            suffix = " [#2fbf2f](MORE AVAILABLE)[/]" if self.has_more else ""
+            text = f"[#59ff59]{len(self.cards)}[/] RECORDS{suffix}"
+        return self._c(text)
 
     def _update_page_indicator(self) -> None:
         if not self.is_mounted:
@@ -738,7 +1104,7 @@ class BiliTuiApp(App[None]):
         else:
             text = f"[#59ff59]{len(self.cards)}[/] [#2fbf2f]/ END[/]"
         try:
-            self.query_one("#page-indicator", Static).update(text)
+            self.query_one("#page-indicator", Static).update(self._c(text))
         except Exception:
             pass
 
@@ -759,7 +1125,7 @@ class BiliTuiApp(App[None]):
             self._update_page_indicator()
             return
 
-        new_cards = [VideoCardData(entry=e, cover=None) for e in entries]
+        new_cards = entries
         self.cards.extend(new_cards)
         self.current_page = next_page
         self.has_more = has_more
@@ -786,7 +1152,7 @@ class BiliTuiApp(App[None]):
         await video_list.mount_all(VideoRow(data) for data in self.cards)
         video_list.index = self.selected_card_index
 
-    async def _append_cards(self, new_cards: list[VideoCardData]) -> None:
+    async def _append_cards(self, new_cards: list[MediaEntry]) -> None:
         video_list = self.query_one("#video-list", ListView)
         await video_list.mount_all(VideoRow(data) for data in new_cards)
 
@@ -816,7 +1182,7 @@ class BiliTuiApp(App[None]):
         self.run_worker(self._play_url(url), exclusive=True, group="player")
 
     def _move_primary_tab(self, delta: int) -> None:
-        options = ["history", "favorites"]
+        options = ["home", "history", "favorites", "search"]
         current = options.index(self.primary_tab)
         next_index = max(0, min(len(options) - 1, current + delta))
         next_tab = options[next_index]
@@ -858,13 +1224,20 @@ class BiliTuiApp(App[None]):
         video_list.index = self.selected_card_index
 
     def _current_source(self) -> BrowseSource | None:
-        if self.primary_tab == "history":
+        if self.primary_tab == "home":
             return self.sources[0] if self.sources else None
+        if self.primary_tab == "history":
+            return self.sources[1] if len(self.sources) > 1 else None
+        if self.primary_tab == "search":
+            return self.sources[2] if len(self.sources) > 2 else None
         if not self.favorite_sources:
             return None
         if 0 <= self.favorite_tab_index < len(self.favorite_sources):
             return self.favorite_sources[self.favorite_tab_index]
         return self.favorite_sources[0]
+
+    def _refresh_nav(self) -> None:
+        self.run_worker(self._render_navigation(), exclusive=True, group="sources")
 
     def _refresh_pane_styles(self) -> None:
         nav = self.query_one("#nav-panel")
@@ -872,8 +1245,12 @@ class BiliTuiApp(App[None]):
         nav.set_class(self.active_pane == "nav", "-active")
         video_list.set_class(self.active_pane == "videos", "-active")
 
+    def _c(self, text: str) -> str:
+        """Re-theme a rich-markup string authored in GREEN to the active palette."""
+        return _apply_palette(text, self._palette)
+
     def _set_status(self, message: str) -> None:
-        self.query_one("#status-line", Static).update(message)
+        self.query_one("#status-line", Static).update(self._c(message))
 
     def _set_help(self) -> None:
         def key(label: str) -> str:
@@ -885,40 +1262,73 @@ class BiliTuiApp(App[None]):
         if self.browser_ready:
             if self.active_pane == "nav":
                 parts = [
-                    f"{key('tab')} list",
                     f"{key('h/l')} section",
-                    f"{key('j/k')} favorite folder",
-                    f"{key('enter')} focus list",
+                    f"{key('j/k')} flow through panes",
+                    f"{key('enter')} focus / search",
+                    f"{key('/')} search",
                     f"{key('u')} URL",
                     f"{key('r')} refresh",
+                    f"{key('L')} logout",
                     f"{key('q')} quit",
                 ]
             else:
                 parts = [
-                    f"{key('tab')} nav",
-                    f"{key('j/k')} select",
-                    f"{key('h')} nav",
+                    f"{key('j/k')} select (k at top -> nav)",
                     f"{key('enter')} play",
+                    f"{key('/')} search",
                     f"{key('u')} URL",
                     f"{key('r')} refresh",
+                    f"{key('L')} logout",
                     f"{key('q')} quit",
                 ]
             text = sep().join(parts)
         else:
             text = f"{key('r')} refresh QR code{sep()}{key('q')} quit"
-        self.query_one("#helpbar", Static).update(text)
+        self.query_one("#helpbar", Static).update(self._c(text))
 
 
 def video_page_url(bvid: str, page_index: int) -> str:
     return f"https://www.bilibili.com/video/{bvid}?p={page_index}"
 
 
-def main() -> None:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="bili-tui", description="Bilibili TUI client")
+    parser.add_argument(
+        "--theme",
+        choices=sorted(THEMES.keys()),
+        default="green",
+        help="CRT phosphor theme: green (default), amber, white, blue.",
+    )
+    return parser.parse_args(argv)
+
+
+def _apply_theme_to_css(palette: dict[str, str]) -> None:
+    """Rewrite every class-level CSS string in this module to the target palette."""
+    BiliTuiApp.CSS = _apply_palette(BiliTuiApp.CSS, palette)
+    PipTab.DEFAULT_CSS = _apply_palette(PipTab.DEFAULT_CSS, palette)
+    VideoRow.DEFAULT_CSS = _apply_palette(VideoRow.DEFAULT_CSS, palette)
+    UrlInputScreen.CSS = _apply_palette(UrlInputScreen.CSS, palette)
+    SearchInputScreen.CSS = _apply_palette(SearchInputScreen.CSS, palette)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
+    palette = THEMES[args.theme]
+    _apply_theme_to_css(palette)
+
     session = load_session()
     client = BiliClient(session=session)
-    app = BiliTuiApp(client=client)
+    app = BiliTuiApp(client=client, palette=palette)
     try:
         app.run()
     finally:
-        save_session(client.export_session())
-        client.close()
+        # The client may have been replaced (e.g. by logout), so persist the
+        # one the app is actually using now.
+        current = app.client
+        save_session(current.export_session())
+        current.close()
+        if current is not client:
+            try:
+                client.close()
+            except Exception:
+                pass
