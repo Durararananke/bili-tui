@@ -25,17 +25,6 @@ uv sync
 uv run bili-tui
 ```
 
-## Controls
-
-- `j` / `k`: move in the current list
-- `h` / `l`: switch between the source list and the video list
-- `tab`: switch between the source list and the video list
-- `enter`: open a folder or play the selected video
-- `p`: play the selected video
-- `u`: paste a Bilibili URL and play it directly
-- `r`: refresh the current view or refresh the login QR code
-- `q`: quit
-
 ## Notes
 
 - `yt-dlp` must be installed and available in `PATH`.
