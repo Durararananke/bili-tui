@@ -5,7 +5,6 @@ A small Python TUI for Bilibili that can:
 - sign in with a QR code
 - browse your favorite folders and recent watch history in a Pip-Boy-inspired list UI
 - open any selected video in IINA through `yt-dlp`
-- open a pasted Bilibili URL without downloading the video file locally
 
 ## Current Stack
 
@@ -14,19 +13,11 @@ A small Python TUI for Bilibili that can:
 - Playback: IINA + `yt-dlp`
 - Environment manager: `uv`
 
-The playback flow follows the same broad idea as `MareDevi/bilibili-tui`: export Bilibili cookies, hand the page URL to the player, and let the player stream through `yt-dlp`.
-
 ## Install
 
 ```bash
 uv sync
 ```
-
-Approximate disk usage:
-
-- virtual environment: about 20-30 MB
-- Python packages and dependencies: about 20-30 MB
-- total: usually about 40-60 MB
 
 ## Run
 
@@ -47,7 +38,6 @@ uv run bili-tui
 
 ## Notes
 
-- Video files are streamed through IINA and `yt-dlp`; they are not downloaded and cached by this app.
 - `yt-dlp` must be installed and available in `PATH`.
 - IINA is expected at `/Applications/IINA.app`.
 - `b23.tv` short links are still not expanded automatically.
